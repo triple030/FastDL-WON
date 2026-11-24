@@ -1,0 +1,19 @@
+# FastDL-WON: optional HTTPS for the web service, in addition to plain HTTP.
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#   (or COMPOSE_FILE=docker-compose.yml:docker-compose.tls.yml in .env)
+#   included from docker-hlds-won2: include: [{ path: [fastdl-won/docker-compose.yml, fastdl-won/docker-compose.tls.yml] }]
+# TLS_DIR holds fullchain.pem and privkey.pem (plain files, no symlinks, readable by uid 101) for PUBLIC_HOST,
+# the host name in sv_won_downloadurl "https://host[:TLS_PORT]/tree". With Let's Encrypt, copy them there from
+# a deploy hook and run "docker exec fastdl-won nginx -s reload". Windows XP clients cannot use HTTPS (no
+# TLS 1.2 / SNI) and fall back to the in-game download.
+services:
+  build:
+    environment:
+      PUBLIC_SCHEME: https
+      PUBLIC_PORT: "${TLS_PORT:-443}"
+  web:
+    ports:
+      - "0.0.0.0:${TLS_PORT:-443}:8443"
+    volumes:
+      - "./web/fastdl-tls.conf:/etc/nginx/conf.d/tls.conf:ro"
+      - "${TLS_DIR:?set TLS_DIR in .env}:/etc/nginx/tls:ro"

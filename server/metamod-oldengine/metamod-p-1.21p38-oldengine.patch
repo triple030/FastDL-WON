@@ -1,0 +1,206 @@
+diff --git a/metamod/meta_eiface.cpp b/metamod/meta_eiface.cpp
+index 5328b94..e2aebdd 100644
+--- a/metamod/meta_eiface.cpp
++++ b/metamod/meta_eiface.cpp
+@@ -40,10 +40,22 @@
+ #include <stdio.h>				// fprintf()
+ #include <stdlib.h>				// exit()
+ #include <string.h>				// memset(), memcpy()
++#include <stddef.h>				// offsetof()
+ 
+ #include "meta_eiface.h"		// me
+ #include "dllapi.h"				// FN_CVARVALUE, FN_CVARVALUE2
+ #include "engine_t.h"			// Engine
++#include "metamod.h"			// gpGlobals
++#include "log_meta.h"			// META_LOG
++
++#ifdef linux
++#include <elf.h>
++#include <dlfcn.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#endif
+ 
+ 
+ // ------------------------------------------------------------------------
+@@ -512,6 +524,7 @@ void HL_enginefuncs_t::initialise_interface( enginefuncs_t *_pFuncs )
+ 
+ 	determine_engine_interface_version();
+ 	fixup_engine_interface();
++	compat_old_engine( _pFuncs );
+ }
+ 
+ 
+@@ -722,3 +735,136 @@ void HL_enginefuncs_t::fixup_engine_interface( void )
+ }
+ 
+ 
++
++
++// ------------------------------------------------------------------------
++// Old engines (original Linux HLDS 3.1.0.4 - 3.1.0.8)
++// ------------------------------------------------------------------------
++//
++// These engines export a shorter enginefuncs_t than the SDK 2.3 one that
++// set_from() copies. Size of g_engfuncsExportedToDlls in engine_i386.so:
++//   3.1.0.4, 3.1.0.6, 3.1.0.7   0x234  (ends before pfnVoice_GetClientListening)
++//   3.1.0.8                     0x23c  (ends before pfnGetPlayerAuthId)
++//   3.1.0.9                     0x240
++//   3.1.1.1e                    0x248
++// The copied tail is whatever data follows the table; determine_engine_
++// interface_version() then leaves pfnGetPlayerAuthId NULL, and AMX Mod X
++// 1.8.1 calls it without a check on every client connect (segfault, eip 0).
++//
++// The table size is read from the engine's own ELF symbol table. The slots
++// that 3.1.1.1e has (up to and including pfnGetPlayerAuthId) but the running
++// engine does not get stand-ins that behave like 3.1.0.9's functions. Nothing
++// changes if the size is unknown or covers these slots (3.1.0.9 and later).
++
++#ifdef linux
++static size_t DLLINTERNAL elf_symbol_size(const unsigned char *m, size_t len,
++		const void *addr, const void *base, const char *name)
++{
++	const Elf32_Ehdr *eh = (const Elf32_Ehdr *) m;
++	if(len < sizeof(*eh) || memcmp(eh->e_ident, ELFMAG, SELFMAG) || eh->e_ident[EI_CLASS] != ELFCLASS32)
++		return 0;
++	if(eh->e_shentsize != sizeof(Elf32_Shdr) || eh->e_shoff > len
++			|| (size_t) eh->e_shnum * sizeof(Elf32_Shdr) > len - eh->e_shoff)
++		return 0;
++	const Elf32_Shdr *sh = (const Elf32_Shdr *) (m + eh->e_shoff);
++	unsigned long bias = eh->e_type == ET_DYN ? (unsigned long) base : 0;
++	for(int i = 0; i < eh->e_shnum; i++) {
++		if(sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM)
++			continue;
++		if(sh[i].sh_link >= eh->e_shnum || sh[i].sh_offset > len || sh[i].sh_size > len - sh[i].sh_offset)
++			continue;
++		const Elf32_Shdr *st = &sh[sh[i].sh_link];
++		if(st->sh_offset > len || st->sh_size > len - st->sh_offset)
++			continue;
++		const Elf32_Sym *sym = (const Elf32_Sym *) (m + sh[i].sh_offset);
++		const char *str = (const char *) (m + st->sh_offset);
++		size_t n = sh[i].sh_size / sizeof(Elf32_Sym);
++		for(size_t k = 0; k < n; k++) {
++			if(sym[k].st_name >= st->sh_size || bias + sym[k].st_value != (unsigned long) addr)
++				continue;
++			if(!strncmp(str + sym[k].st_name, name, st->sh_size - sym[k].st_name))
++				return sym[k].st_size;
++		}
++	}
++	return 0;
++}
++
++// size in bytes of the table the engine passed, 0 if unknown
++static size_t DLLINTERNAL engine_table_size(const void *tbl)
++{
++	Dl_info di;
++	if(!dladdr(tbl, &di) || !di.dli_fbase)
++		return 0;
++	const char *path = (di.dli_fname && di.dli_fname[0]) ? di.dli_fname : "/proc/self/exe";
++	int fd = open(path, O_RDONLY);
++	if(fd < 0)
++		return 0;
++	size_t size = 0;
++	struct stat sb;
++	if(!fstat(fd, &sb) && sb.st_size > 0) {
++		void *m = mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++		if(m != MAP_FAILED) {
++			size = elf_symbol_size((const unsigned char *) m, sb.st_size, tbl, di.dli_fbase,
++					"g_engfuncsExportedToDlls");
++			munmap(m, sb.st_size);
++		}
++	}
++	close(fd);
++	return size;
++}
++#endif /* linux */
++
++char compat_engine_note[160] DLLHIDDEN = "";
++
++// 3.1.0.4 - 3.1.0.8 have no voice API
++static qboolean compat_Voice_GetClientListening(int, int)
++{
++	return false;
++}
++
++static qboolean compat_Voice_SetClientListening(int, int, qboolean)
++{
++	return false;
++}
++
++// as PF_GetPlayerAuthId of 3.1.0.9 for WON clients: "BOT" for a fake
++// client, else the WON id as "%u" (4294967295 for a LAN client), "" if
++// the edict is not a player
++static const char *compat_GetPlayerAuthId(edict_t *e)
++{
++	static char id[64];
++	id[0] = '\0';
++	if(!e || !gpGlobals || !g_engfuncs.pfnIndexOfEdict || !g_engfuncs.pfnGetPlayerWONId)
++		return id;
++	int i = g_engfuncs.pfnIndexOfEdict(e);
++	if(i < 1 || i > gpGlobals->maxClients)
++		return id;
++	if(e->v.flags & FL_FAKECLIENT)
++		return "BOT";
++	snprintf(id, sizeof(id), "%u", g_engfuncs.pfnGetPlayerWONId(e));
++	return id;
++}
++
++void HL_enginefuncs_t::compat_old_engine( enginefuncs_t *_pFuncs )
++{
++#ifdef linux
++	size_t have = engine_table_size(_pFuncs);
++	size_t vget = offsetof(enginefuncs_t, pfnVoice_GetClientListening);
++	size_t vset = offsetof(enginefuncs_t, pfnVoice_SetClientListening);
++	size_t auth = offsetof(enginefuncs_t, pfnGetPlayerAuthId);
++	// only the 3.1.0.x tables, which end inside the voice / auth id slots
++	if(have <= offsetof(enginefuncs_t, pfnGetPlayerStats) || have > auth)
++		return;
++	if(have <= vget)
++		pfnVoice_GetClientListening = compat_Voice_GetClientListening;
++	if(have <= vset)
++		pfnVoice_SetClientListening = compat_Voice_SetClientListening;
++	pfnGetPlayerAuthId = compat_GetPlayerAuthId;
++	// printed with the startup banner (logging is not set up yet)
++	snprintf(compat_engine_note, sizeof(compat_engine_note),
++			"Old engine (%d engine functions): stand-ins for%s%s pfnGetPlayerAuthId",
++			(int) (have / sizeof(void *)),
++			have <= vget ? " pfnVoice_GetClientListening" : "",
++			have <= vset ? " pfnVoice_SetClientListening" : "");
++#endif
++}
+diff --git a/metamod/meta_eiface.h b/metamod/meta_eiface.h
+index 08a6a7a..75829d5 100644
+--- a/metamod/meta_eiface.h
++++ b/metamod/meta_eiface.h
+@@ -470,11 +470,16 @@ struct HL_enginefuncs_t : public meta_enginefuncs_t {
+ 	// Fixup the enginefuncs pointers according to the determined
+ 	// version as some pointers may be invalid.
+ 	void DLLINTERNAL fixup_engine_interface( void );
++	// fills the slots an old engine does not export (see meta_eiface.cpp)
++	void DLLINTERNAL compat_old_engine( enginefuncs_t *pFuncs );
+ };
+ 
+ 
+ inline HL_enginefuncs_t :: HL_enginefuncs_t() : meta_enginefuncs_t() { };
+ 
+ 
++// set by HL_enginefuncs_t::compat_old_engine() when it filled slots, printed with the banner
++extern char compat_engine_note[] DLLHIDDEN;
++
+ #endif /* META_EIFACE_H */
+ 
+diff --git a/metamod/metamod.cpp b/metamod/metamod.cpp
+index 70e8c6a..b1b15c6 100644
+--- a/metamod/metamod.cpp
++++ b/metamod/metamod.cpp
+@@ -102,6 +102,8 @@ int DLLINTERNAL metamod_startup(void) {
+ 	META_CONS("   %s comes with ABSOLUTELY NO WARRANTY; for details type `meta gpl'.", VNAME);
+ 	META_CONS("   This is free software, and you are welcome to redistribute it");
+ 	META_CONS("   under certain conditions; type `meta gpl' for details.");
++	if(compat_engine_note[0])
++		META_CONS("   %s", compat_engine_note);
+ 	META_CONS("   ");
+ 
+ 	META_LOG("%s v%s  %s", VNAME, VVERSION, VDATE);

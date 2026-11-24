@@ -1,0 +1,10 @@
+# build output
+*.asi
+*.dll
+*.amxx
+client/test/build/
+# server data: never commit the signing key or the web tree
+server/fastdl/
+server/dl/
+server/web/logs/
+__pycache__/

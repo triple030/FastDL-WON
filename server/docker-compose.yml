@@ -1,0 +1,105 @@
+# FastDL-WON server side in one step (release layout: this file is server/docker-compose.yml).
+#
+# Next to Ch0wW's docker-hlds-won2 (the folder docker-hlds-won2/fastdl-won/): every default fits that layout.
+#   cp .env.example .env      # FASTDL_TREES and PUBLIC_HOST (and PORT if 27980 is taken)
+#   in docker-hlds-won2/docker-compose.override.yml:   include: [fastdl-won/docker-compose.yml]
+#   docker compose up -d      # in docker-hlds-won2: game servers, then build + web
+# Standalone (any other place): set DATA_DIR in .env and run docker compose up -d in this folder.
+#
+#   cat keys/sv_won_dlkey.cfg                            # server.cfg lines per tree (also: docker compose logs build)
+#   docker compose run --rm build check                  # compare each server.cfg with its tree and the key
+#   docker compose run --rm build build cstrike          # rebuild one tree after map changes (no argument: all)
+# Clients keep downloading during a rebuild: a tree is switched to its new generation in one rename.
+# Step by step: README.md (Installation for Server ops).
+#
+# DATA_DIR is the folder that holds the mod folders (default ../config: docker-hlds-won2/config). FastDL-WON
+# keeps the web root and the access log in DATA_DIR/fastdl-won (dl/, logs/). The trees HARDLINK the game
+# files, and a hardlink only works within one file system and one mount, so the build service mounts DATA_DIR
+# once, read-write; it writes only below fastdl-won/. Copies instead of hardlinks only with
+# FASTDL_ALLOW_COPY=1. The signing key is NOT in DATA_DIR: it lives in ./keys next to this file, mounted into
+# the build service only. Relative paths here are relative to this file's folder, also when it is included.
+name: fastdl-won
+
+services:
+  build:
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM alpine:3.21@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
+        RUN apk add --no-cache bash coreutils findutils util-linux acl python3 py3-cryptography
+    image: fastdl-won-build:local
+    restart: "no"
+    # Starts as root only to hand the web service's new (empty, root-owned) mount folders to the data owner,
+    # then runs as FASTDL_UID:FASTDL_GID, default the owner of DATA_DIR (root is refused). No network.
+    user: "0:0"
+    cap_add: [CHOWN, SETUID, SETGID]
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      FASTDL_TREES: "${FASTDL_TREES:?set FASTDL_TREES in .env}"
+      FASTDL_SERVERCFG: "${FASTDL_SERVERCFG:-}"
+      FASTDL_DIR: fastdl-won
+      FASTDL_KEYDIR: /keys
+      FASTDL_ALLOW_COPY: "${FASTDL_ALLOW_COPY:-}"
+      FASTDL_UID: "${FASTDL_UID:-}"
+      FASTDL_GID: "${FASTDL_GID:-}"
+      PORT: "${PORT:-27980}"
+      PUBLIC_HOST: "${PUBLIC_HOST:-}"
+    # bind mounts that must exist (Docker would otherwise create a missing DATA_DIR as an empty root folder)
+    volumes:
+      - { type: bind, source: "${DATA_DIR:-../config}", target: /data, bind: { create_host_path: false } }
+      # the signing key: only here, not in DATA_DIR (the game servers and their plugins can read that)
+      - { type: bind, source: ./keys, target: /keys, bind: { create_host_path: false } }
+      - { type: bind, source: ./tools, target: /fastdl/tools, read_only: true, bind: { create_host_path: false } }
+    entrypoint: ["/fastdl/tools/fastdl-compose.sh"]
+    command: ["build"]
+
+  web:
+    # nginx runs as uid 101 without any capability (port 8080 inside). Image pinned by digest: bump it for
+    # nginx security releases (docker pull nginx:1.30-alpine, docker images --digests nginx).
+    image: nginx:1.30-alpine@sha256:caf4e1e032a20f9c3c5e28fc7f25ffd768ad8677b4975c54193075997b3a97e3
+    container_name: "${FASTDL_WEB_NAME:-fastdl-won}"
+    restart: unless-stopped
+    depends_on:
+      build:
+        condition: service_completed_successfully
+    user: "101:101"
+    # logs/ belongs to the owner of DATA_DIR (mode 2770); nginx writes it through an ACL entry for uid 101
+    # that the build sets, or, on a file system without ACLs, through this group (then set FASTDL_GID)
+    group_add: ["${FASTDL_GID:-1000}"]
+    ports:
+      # IPv4 only: Docker forwards IPv6 through its userland proxy, so nginx would see one gateway
+      # address for every IPv6 client (shared per-IP limits, wrong IP in the access log)
+      - "0.0.0.0:${PORT:-27980}:8080"
+    volumes:
+      # dl/ and logs/ do not exist before the first build: Docker creates them (root-owned, empty) when it
+      # creates this container, and the build hands them to the data owner before it writes anything
+      - { type: bind, source: "${DATA_DIR:-../config}/fastdl-won/dl", target: /usr/share/nginx/html, read_only: true, bind: { create_host_path: true } }
+      - { type: bind, source: ./web/fastdl.conf, target: /etc/nginx/conf.d/default.conf, read_only: true, bind: { create_host_path: false } }
+      - { type: bind, source: "${DATA_DIR:-../config}/fastdl-won/logs", target: /var/log/fastdl, bind: { create_host_path: true } }
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=16m,uid=101,gid=101
+      - /run:size=1m,uid=101,gid=101
+      - /tmp:size=1m,uid=101,gid=101
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    cpus: 0.5
+    pids_limit: 64
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "-U", "FastDL-WON/healthcheck", "http://127.0.0.1:8080/healthz"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
